@@ -1,0 +1,320 @@
+/*
+  UHF Senior Module - Arduino test sketch
+  =========================================
+  Talks to the module over its raw UART protocol, per
+  UHF_Senior_Module_User_guide_V1_2:
+
+    Command frame:  HEAD ADDR CMD(2) LEN Data[0..255] CRC16(2)
+    Response frame: HEAD ADDR CMD(2) LEN STATUS Data[0..254] CRC16(2)
+
+    HEAD   = 0xCF (fixed sync byte)
+    ADDR   = 0xFF broadcast (module echoes its real address in responses)
+    CMD    = 2 bytes, MSB sent first
+    LEN    = length of the Information Field (STATUS + Data, response) or
+             (Data only, command) - max 255
+    CRC16  = CRC16 over HEAD..end of Data, MSB then LSB (Appendix B algorithm,
+             init 0xFFFF, poly 0x8408, reflected)
+
+  Wiring:
+    Module UART is 3.3V/5V TTL (per the guide's "Docking communication
+    protocol", 115200 8N1). Connect:
+       Module TX -> Arduino RX
+       Module RX -> Arduino TX
+       GND       -> GND
+
+  Serial ports:
+    115200 baud is too fast to be reliable on SoftwareSerial on an
+    AVR Uno/Nano. Use a board with a spare HARDWARE serial port:
+      - Arduino Mega 2560: use Serial1 (pins 19 RX1 / 18 TX1)
+      - ESP32: use Serial2 (or any UART pins you map)
+      - Leonardo/Micro: use Serial1
+    If you only have an Uno, either use SoftwareSerial at a reduced
+    baud rate configured on the module (not recommended for continuous
+    inventory) or use an Uno as a passthrough to a Mega/ESP32.
+
+    Change READER_SERIAL below to match your board.
+*/
+
+#include <Arduino.h>
+
+// ---------------------------------------------------------------------
+// Pick the hardware serial port connected to the reader module.
+// Mega / Leonardo / ESP32 have a Serial1 you can use directly.
+#define READER_SERIAL Serial2   // ESP32: using Serial2 with explicit pins below
+#define READER_RX_PIN 26        // ESP32 GPIO26 <- module TX
+#define READER_TX_PIN 27        // ESP32 GPIO27 -> module RX
+
+// USB serial (to your PC / Serial Monitor) stays on Serial.
+// ---------------------------------------------------------------------
+
+// ---- protocol constants (guide section 1.2 / 2.1) --------------------
+const uint8_t  HEAD          = 0xCF;
+const uint8_t  ADDR_BROADCAST = 0xFF;
+
+const uint16_t CMD_MODULE_INIT           = 0x0050;
+const uint16_t CMD_GET_INFO              = 0x0051;
+const uint16_t CMD_SET_PWR               = 0x0053;
+const uint16_t CMD_INVENTORYISO_CONTINUE = 0x0001;
+const uint16_t CMD_INVENTORYISO_STOP     = 0x0002;
+
+// ---- user-adjustable settings -----------------------------------------
+const uint8_t  RF_POWER_DBM = 20;   // valid range per guide: 10~33 dBm
+// InvType per guide 2.3.1:
+//   0x00 = time-based inventory, InvParam = seconds (0 = run until stopped)
+const uint8_t  INV_TYPE  = 0x00;
+const uint32_t INV_PARAM = 0x00000000; // 0 = continue until we send STOP
+
+// ------------------------------------------------------------------------
+// CRC16 - Appendix B of the guide, translated to Arduino/C++.
+// PRESET_VALUE = 0xFFFF, POLYNOMIAL = 0x8408 (reflected CRC-16/CCITT-FALSE
+// variant, aka CRC-16/X-25 style right-shift form).
+// ------------------------------------------------------------------------
+uint16_t crc16Cal(const uint8_t *data, uint8_t len) {
+  uint16_t crc = 0xFFFF;
+  for (uint8_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (uint8_t j = 0; j < 8; j++) {
+      if (crc & 0x0001) {
+        crc = (crc >> 1) ^ 0x8408;
+      } else {
+        crc = (crc >> 1);
+      }
+    }
+  }
+  return crc;
+}
+
+// ------------------------------------------------------------------------
+// Build and send a command frame: HEAD ADDR CMD(2) LEN Data[] CRC16(2)
+// cmd is sent MSB first, per "Data transmission sequence: most significant
+// byte is sent first".
+// ------------------------------------------------------------------------
+void sendCommand(uint16_t cmd, const uint8_t *data, uint8_t dataLen) {
+  uint8_t frame[8 + 255];
+  uint8_t idx = 0;
+
+  frame[idx++] = HEAD;
+  frame[idx++] = ADDR_BROADCAST;
+  frame[idx++] = (cmd >> 8) & 0xFF;   // CMD MSB
+  frame[idx++] = cmd & 0xFF;          // CMD LSB
+  frame[idx++] = dataLen;             // LEN
+
+  for (uint8_t i = 0; i < dataLen; i++) {
+    frame[idx++] = data[i];
+  }
+
+  uint16_t crc = crc16Cal(frame, idx); // CRC over HEAD..Data
+  frame[idx++] = (crc >> 8) & 0xFF;    // CRC MSB
+  frame[idx++] = crc & 0xFF;           // CRC LSB
+
+  READER_SERIAL.write(frame, idx);
+}
+
+void sendModuleInit() {
+  sendCommand(CMD_MODULE_INIT, nullptr, 0);
+}
+
+void sendGetInfo() {
+  sendCommand(CMD_GET_INFO, nullptr, 0);
+}
+
+void sendSetPower(uint8_t powerDbm) {
+  uint8_t data[2] = { powerDbm, 0x00 }; // Power, Resv
+  sendCommand(CMD_SET_PWR, data, sizeof(data));
+}
+
+void sendInventoryStart(uint8_t invType, uint32_t invParam) {
+  uint8_t data[5];
+  data[0] = invType;
+  // InvParam is 4 bytes; guide doesn't state byte order explicitly for this
+  // field, but frames are documented MSB-first throughout, so send MSB first.
+  data[1] = (invParam >> 24) & 0xFF;
+  data[2] = (invParam >> 16) & 0xFF;
+  data[3] = (invParam >> 8) & 0xFF;
+  data[4] = invParam & 0xFF;
+  sendCommand(CMD_INVENTORYISO_CONTINUE, data, sizeof(data));
+}
+
+void sendInventoryStop() {
+  sendCommand(CMD_INVENTORYISO_STOP, nullptr, 0);
+}
+
+// ------------------------------------------------------------------------
+// Read and parse one response frame from the module, blocking up to
+// timeoutMs. Returns true if a full frame with a valid CRC was read.
+// out fields: cmd, status, payload, payloadLen (payload excludes STATUS)
+// ------------------------------------------------------------------------
+bool readResponse(uint16_t &cmdOut, uint8_t &statusOut,
+                   uint8_t *payloadOut, uint8_t &payloadLenOut,
+                   uint32_t timeoutMs = 1500) {
+  uint32_t start = millis();
+
+  // 1. sync on HEAD
+  while (true) {
+    if (millis() - start > timeoutMs) return false;
+    if (READER_SERIAL.available()) {
+      if (READER_SERIAL.read() == HEAD) break;
+    }
+  }
+
+  uint8_t header[4]; // ADDR CMD_HI CMD_LO LEN
+  for (uint8_t i = 0; i < 4; i++) {
+    while (!READER_SERIAL.available()) {
+      if (millis() - start > timeoutMs) return false;
+    }
+    header[i] = READER_SERIAL.read();
+  }
+
+  uint8_t addr = header[0];
+  (void)addr;
+  uint16_t cmd = ((uint16_t)header[1] << 8) | header[2];
+  uint8_t len  = header[3]; // length of STATUS + payload
+
+  if (len == 0 || len > 255) return false;
+
+  uint8_t infoField[255];
+  for (uint8_t i = 0; i < len; i++) {
+    while (!READER_SERIAL.available()) {
+      if (millis() - start > timeoutMs) return false;
+    }
+    infoField[i] = READER_SERIAL.read();
+  }
+
+  uint8_t crcBytes[2];
+  for (uint8_t i = 0; i < 2; i++) {
+    while (!READER_SERIAL.available()) {
+      if (millis() - start > timeoutMs) return false;
+    }
+    crcBytes[i] = READER_SERIAL.read();
+  }
+  uint16_t receivedCrc = ((uint16_t)crcBytes[0] << 8) | crcBytes[1];
+
+  // rebuild HEAD..Data to verify CRC
+  uint8_t check[6 + 255];
+  uint8_t ci = 0;
+  check[ci++] = HEAD;
+  check[ci++] = header[0];
+  check[ci++] = header[1];
+  check[ci++] = header[2];
+  check[ci++] = header[3];
+  for (uint8_t i = 0; i < len; i++) check[ci++] = infoField[i];
+
+  uint16_t calcCrc = crc16Cal(check, ci);
+  if (calcCrc != receivedCrc) {
+    Serial.println(F("  [!] CRC mismatch, dropping frame"));
+    return false;
+  }
+
+  statusOut = infoField[0];
+  payloadLenOut = len - 1;
+  for (uint8_t i = 0; i < payloadLenOut; i++) {
+    payloadOut[i] = infoField[1 + i];
+  }
+  cmdOut = cmd;
+  return true;
+}
+
+// ------------------------------------------------------------------------
+// Print one RFM_INVENTORYISO_CONTINUE response (guide 2.3.1 PAYLOAD layout:
+// RSSI(2) Antenna(1) Channel(1) EPC_LEN(1) EPC_NUM(N))
+// ------------------------------------------------------------------------
+void printTagPayload(const uint8_t *payload, uint8_t payloadLen) {
+  if (payloadLen < 5) {
+    Serial.println(F("  [!] tag payload too short"));
+    return;
+  }
+  int16_t rssiRaw = (int16_t)(((uint16_t)payload[0] << 8) | payload[1]);
+  float rssiDbm = rssiRaw / 10.0; // unit: 0.1 dBm, signed
+  uint8_t antenna = payload[2];
+  uint8_t channel = payload[3];
+  uint8_t epcLen  = payload[4];
+
+  Serial.print(F("  Tag EPC: "));
+  for (uint8_t i = 0; i < epcLen && (5 + i) < payloadLen; i++) {
+    if (payload[5 + i] < 0x10) Serial.print('0');
+    Serial.print(payload[5 + i], HEX);
+    Serial.print(' ');
+  }
+  Serial.print(F(" | RSSI: "));
+  Serial.print(rssiDbm, 1);
+  Serial.print(F("dBm | Ant: "));
+  Serial.print(antenna);
+  Serial.print(F(" | Ch: "));
+  Serial.println(channel);
+}
+
+// ------------------------------------------------------------------------
+
+bool inventoryRunning = false;
+
+void setup() {
+  Serial.begin(115200);        // USB serial monitor
+  READER_SERIAL.begin(115200, SERIAL_8N1, READER_RX_PIN, READER_TX_PIN); // module UART, per guide 1.1
+  delay(500);
+
+  Serial.println(F("UHF module test starting..."));
+
+  // 1. Init module (stop any current actions)
+  sendModuleInit();
+  waitAndPrintSimpleResponse("MODULE_INIT");
+
+  // 2. Read version info (optional sanity check)
+  sendGetInfo();
+  waitAndPrintSimpleResponse("GET_INFO");
+
+  // 3. Set RF power
+  sendSetPower(RF_POWER_DBM);
+  waitAndPrintSimpleResponse("SET_PWR");
+
+  Serial.println(F("Setup done. Type 'g' + Enter in the Serial Monitor to start inventory, 's' + Enter to stop."));
+}
+
+void waitAndPrintSimpleResponse(const char *label) {
+  uint16_t cmd; uint8_t status; uint8_t payload[255]; uint8_t payloadLen;
+  if (readResponse(cmd, status, payload, payloadLen)) {
+    Serial.print(label);
+    Serial.print(F(" -> STATUS=0x"));
+    Serial.println(status, HEX);
+  } else {
+    Serial.print(label);
+    Serial.println(F(" -> no response / timeout"));
+  }
+}
+
+void loop() {
+  // Serial monitor commands: 'g' = start inventory, 's' = stop inventory
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'g' && !inventoryRunning) {
+      Serial.println(F("Starting inventory..."));
+      sendInventoryStart(INV_TYPE, INV_PARAM);
+      inventoryRunning = true;
+    } else if (c == 's' && inventoryRunning) {
+      Serial.println(F("Stopping inventory..."));
+      sendInventoryStop();
+      waitAndPrintSimpleResponse("INVENTORY_STOP");
+      inventoryRunning = false;
+    }
+  }
+
+  // While inventory is running, keep reading & printing tag responses.
+  if (inventoryRunning && READER_SERIAL.available()) {
+    uint16_t cmd; uint8_t status; uint8_t payload[255]; uint8_t payloadLen;
+    if (readResponse(cmd, status, payload, payloadLen, 200)) {
+      if (cmd == CMD_INVENTORYISO_CONTINUE) {
+        if (status == 0x00) {
+          printTagPayload(payload, payloadLen);
+        } else if (status == 0x12) {
+          Serial.println(F("  -- inventory round complete --"));
+          // For a truly continuous read, re-issue the start command here
+          // if INV_TYPE isn't already set to "run until stopped".
+        } else if (status == 0x13) {
+          // no tag counted this poll, ignore silently
+        } else {
+          Serial.print(F("  [!] inventory STATUS=0x"));
+          Serial.println(status, HEX);
+        }
+      }
+    }
+  }
+}
