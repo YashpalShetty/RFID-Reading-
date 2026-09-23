@@ -1,0 +1,333 @@
+/*
+  UHF Senior Module + Capacitive Soil Moisture Sensor - CSV Logger
+  ===================================================================
+  Built directly on top of the confirmed-working UHF test sketch
+  (plain Serial1, no custom pin mapping). Adds periodic capacitive
+  moisture sensor sampling and combines moisture + RSSI readings into
+  a single CSV stream printed over the USB Serial port.
+
+  Capture that CSV stream to a file on your PC (see csv_logger.py) and
+  open it directly in Excel.
+
+  RFID wiring (unchanged from your working sketch):
+    Module TX -> board RX1
+    Module RX -> board TX1
+    GND       -> GND
+    (Mega 2560: pins 19 RX1 / 18 TX1. Leonardo/Micro: Serial1 pins.
+     ESP32: Serial1 default pins vary by core version - if this is an
+     ESP32 and Serial1 "just worked" for you already, leave it as is.)
+
+  Moisture sensor wiring (new):
+    Moisture sensor VCC  -> 3V3 or 5V (check your sensor's rating)
+    Moisture sensor GND  -> board GND
+    Moisture sensor AOUT -> board A0
+
+  CSV columns printed over Serial (115200 baud):
+    timestamp_ms,moisture_raw,moisture_voltage,tag_epc,rssi_dbm
+
+  - A row is printed every MOISTURE_SAMPLE_MS milliseconds regardless
+    of whether a tag was read (tag_epc/rssi_dbm left blank).
+  - A row is also printed immediately whenever a tag is read during
+    inventory, with a fresh moisture reading taken at that instant,
+    so moisture and RSSI are captured together.
+*/
+
+#include <Arduino.h>
+
+// ---------------------------------------------------------------------
+// Pick the hardware serial port connected to the reader module.
+// Unchanged from your working sketch.
+#define READER_SERIAL Serial1
+
+// Moisture sensor analog pin - A0 works the same way across AVR
+// (Mega/Leonardo) and ESP32 boards.
+#define MOISTURE_PIN A0
+
+// How often to take a moisture-only background reading (ms)
+const uint32_t MOISTURE_SAMPLE_MS = 1000;
+
+// ADC resolution/reference differs by board:
+//   - AVR (Mega/Leonardo/Uno): 10-bit ADC, 0-1023, 5V reference (or 3.3V
+//     on some boards - check yours)
+//   - ESP32: 12-bit ADC by default, 0-4095, 3.3V reference
+// This is handled automatically below via #ifdef ESP32.
+#if defined(ESP32)
+  const float ADC_MAX  = 4095.0;
+  const float ADC_VREF = 3.3;
+#else
+  const float ADC_MAX  = 1023.0;
+  const float ADC_VREF = 5.0;   // change to 3.3 if your board runs at 3.3V
+#endif
+// ---------------------------------------------------------------------
+
+// ---- protocol constants (guide section 1.2 / 2.1) --------------------
+const uint8_t  HEAD          = 0xCF;
+const uint8_t  ADDR_BROADCAST = 0xFF;
+
+const uint16_t CMD_MODULE_INIT           = 0x0050;
+const uint16_t CMD_GET_INFO              = 0x0051;
+const uint16_t CMD_SET_PWR               = 0x0053;
+const uint16_t CMD_INVENTORYISO_CONTINUE = 0x0001;
+const uint16_t CMD_INVENTORYISO_STOP     = 0x0002;
+
+// ---- user-adjustable settings -----------------------------------------
+const uint8_t  RF_POWER_DBM = 20;   // valid range per guide: 10~33 dBm
+const uint8_t  INV_TYPE  = 0x00;
+const uint32_t INV_PARAM = 0x00000000; // 0 = continue until we send STOP
+
+// ------------------------------------------------------------------------
+uint16_t crc16Cal(const uint8_t *data, uint8_t len) {
+  uint16_t crc = 0xFFFF;
+  for (uint8_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (uint8_t j = 0; j < 8; j++) {
+      if (crc & 0x0001) {
+        crc = (crc >> 1) ^ 0x8408;
+      } else {
+        crc = (crc >> 1);
+      }
+    }
+  }
+  return crc;
+}
+
+void sendCommand(uint16_t cmd, const uint8_t *data, uint8_t dataLen) {
+  uint8_t frame[8 + 255];
+  uint8_t idx = 0;
+
+  frame[idx++] = HEAD;
+  frame[idx++] = ADDR_BROADCAST;
+  frame[idx++] = (cmd >> 8) & 0xFF;
+  frame[idx++] = cmd & 0xFF;
+  frame[idx++] = dataLen;
+
+  for (uint8_t i = 0; i < dataLen; i++) {
+    frame[idx++] = data[i];
+  }
+
+  uint16_t crc = crc16Cal(frame, idx);
+  frame[idx++] = (crc >> 8) & 0xFF;
+  frame[idx++] = crc & 0xFF;
+
+  READER_SERIAL.write(frame, idx);
+}
+
+void sendModuleInit() { sendCommand(CMD_MODULE_INIT, nullptr, 0); }
+void sendGetInfo()    { sendCommand(CMD_GET_INFO, nullptr, 0); }
+
+void sendSetPower(uint8_t powerDbm) {
+  uint8_t data[2] = { powerDbm, 0x00 };
+  sendCommand(CMD_SET_PWR, data, sizeof(data));
+}
+
+void sendInventoryStart(uint8_t invType, uint32_t invParam) {
+  uint8_t data[5];
+  data[0] = invType;
+  data[1] = (invParam >> 24) & 0xFF;
+  data[2] = (invParam >> 16) & 0xFF;
+  data[3] = (invParam >> 8) & 0xFF;
+  data[4] = invParam & 0xFF;
+  sendCommand(CMD_INVENTORYISO_CONTINUE, data, sizeof(data));
+}
+
+void sendInventoryStop() { sendCommand(CMD_INVENTORYISO_STOP, nullptr, 0); }
+
+// ------------------------------------------------------------------------
+bool readResponse(uint16_t &cmdOut, uint8_t &statusOut,
+                   uint8_t *payloadOut, uint8_t &payloadLenOut,
+                   uint32_t timeoutMs = 1500) {
+  uint32_t start = millis();
+
+  while (true) {
+    if (millis() - start > timeoutMs) return false;
+    if (READER_SERIAL.available()) {
+      if (READER_SERIAL.read() == HEAD) break;
+    }
+  }
+
+  uint8_t header[4];
+  for (uint8_t i = 0; i < 4; i++) {
+    while (!READER_SERIAL.available()) {
+      if (millis() - start > timeoutMs) return false;
+    }
+    header[i] = READER_SERIAL.read();
+  }
+
+  uint16_t cmd = ((uint16_t)header[1] << 8) | header[2];
+  uint8_t len  = header[3];
+
+  if (len == 0 || len > 255) return false;
+
+  uint8_t infoField[255];
+  for (uint8_t i = 0; i < len; i++) {
+    while (!READER_SERIAL.available()) {
+      if (millis() - start > timeoutMs) return false;
+    }
+    infoField[i] = READER_SERIAL.read();
+  }
+
+  uint8_t crcBytes[2];
+  for (uint8_t i = 0; i < 2; i++) {
+    while (!READER_SERIAL.available()) {
+      if (millis() - start > timeoutMs) return false;
+    }
+    crcBytes[i] = READER_SERIAL.read();
+  }
+  uint16_t receivedCrc = ((uint16_t)crcBytes[0] << 8) | crcBytes[1];
+
+  uint8_t check[6 + 255];
+  uint8_t ci = 0;
+  check[ci++] = HEAD;
+  check[ci++] = header[0];
+  check[ci++] = header[1];
+  check[ci++] = header[2];
+  check[ci++] = header[3];
+  for (uint8_t i = 0; i < len; i++) check[ci++] = infoField[i];
+
+  uint16_t calcCrc = crc16Cal(check, ci);
+  if (calcCrc != receivedCrc) {
+    return false; // CRC mismatch - drop silently, keeps CSV stream clean
+  }
+
+  statusOut = infoField[0];
+  payloadLenOut = len - 1;
+  for (uint8_t i = 0; i < payloadLenOut; i++) {
+    payloadOut[i] = infoField[1 + i];
+  }
+  cmdOut = cmd;
+  return true;
+}
+
+// ------------------------------------------------------------------------
+// Read the moisture sensor and return raw ADC + voltage.
+// ------------------------------------------------------------------------
+void readMoisture(int &rawOut, float &voltsOut) {
+  rawOut = analogRead(MOISTURE_PIN);
+  voltsOut = (rawOut / ADC_MAX) * ADC_VREF;
+}
+
+// ------------------------------------------------------------------------
+// Print one CSV row. epcHex/rssi may be empty strings when there is no
+// tag reading to attach to this row.
+// ------------------------------------------------------------------------
+void printCsvRow(int moistureRaw, float moistureVolts,
+                  const String &epcHex, const String &rssiStr) {
+  Serial.print(millis());
+  Serial.print(',');
+  Serial.print(moistureRaw);
+  Serial.print(',');
+  Serial.print(moistureVolts, 3);
+  Serial.print(',');
+  Serial.print(epcHex);
+  Serial.print(',');
+  Serial.println(rssiStr);
+}
+
+// ------------------------------------------------------------------------
+// Parse and print one RFM_INVENTORYISO_CONTINUE response, taking a fresh
+// moisture reading at the same instant so both values share a row.
+// ------------------------------------------------------------------------
+void handleTagPayload(const uint8_t *payload, uint8_t payloadLen) {
+  if (payloadLen < 5) return;
+
+  int16_t rssiRaw = (int16_t)(((uint16_t)payload[0] << 8) | payload[1]);
+  float rssiDbm = rssiRaw / 10.0;
+  uint8_t epcLen = payload[4];
+
+  String epcHex = "";
+  for (uint8_t i = 0; i < epcLen && (5 + i) < payloadLen; i++) {
+    if (payload[5 + i] < 0x10) epcHex += '0';
+    epcHex += String(payload[5 + i], HEX);
+  }
+  epcHex.toUpperCase();
+
+  int moistureRaw;
+  float moistureVolts;
+  readMoisture(moistureRaw, moistureVolts);
+
+  printCsvRow(moistureRaw, moistureVolts, epcHex, String(rssiDbm, 1));
+}
+
+// ------------------------------------------------------------------------
+bool inventoryRunning = false;
+uint32_t lastMoistureSample = 0;
+
+void setup() {
+  Serial.begin(115200);        // USB serial monitor
+  READER_SERIAL.begin(115200); // module UART, per guide 1.1 - unchanged
+
+#if defined(ESP32)
+  analogReadResolution(12);    // 0-4095, only relevant on ESP32
+#endif
+
+  delay(500);
+
+  Serial.println(F("# UHF + moisture CSV logger starting..."));
+
+  sendModuleInit();
+  waitAndPrintStatus("MODULE_INIT");
+
+  sendGetInfo();
+  waitAndPrintStatus("GET_INFO");
+
+  sendSetPower(RF_POWER_DBM);
+  waitAndPrintStatus("SET_PWR");
+
+  Serial.println(F("# Type 'g' + Enter to start inventory, 's' + Enter to stop."));
+  Serial.println(F("# CSV header:"));
+  Serial.println(F("timestamp_ms,moisture_raw,moisture_voltage,tag_epc,rssi_dbm"));
+}
+
+void waitAndPrintStatus(const char *label) {
+  uint16_t cmd; uint8_t status; uint8_t payload[255]; uint8_t payloadLen;
+  if (readResponse(cmd, status, payload, payloadLen)) {
+    Serial.print(F("# "));
+    Serial.print(label);
+    Serial.print(F(" -> STATUS=0x"));
+    Serial.println(status, HEX);
+  } else {
+    Serial.print(F("# "));
+    Serial.print(label);
+    Serial.println(F(" -> no response / timeout"));
+  }
+}
+
+void loop() {
+  // Serial monitor commands: 'g' = start inventory, 's' = stop inventory
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'g' && !inventoryRunning) {
+      Serial.println(F("# Starting inventory..."));
+      sendInventoryStart(INV_TYPE, INV_PARAM);
+      inventoryRunning = true;
+    } else if (c == 's' && inventoryRunning) {
+      Serial.println(F("# Stopping inventory..."));
+      sendInventoryStop();
+      waitAndPrintStatus("INVENTORY_STOP");
+      inventoryRunning = false;
+    }
+  }
+
+  // Periodic moisture-only background sample (keeps a continuous trace
+  // even when no tag is being read).
+  if (millis() - lastMoistureSample >= MOISTURE_SAMPLE_MS) {
+    lastMoistureSample = millis();
+    int moistureRaw;
+    float moistureVolts;
+    readMoisture(moistureRaw, moistureVolts);
+    printCsvRow(moistureRaw, moistureVolts, "", "");
+  }
+
+  // While inventory is running, read & print tag responses combined
+  // with a fresh moisture reading.
+  if (inventoryRunning && READER_SERIAL.available()) {
+    uint16_t cmd; uint8_t status; uint8_t payload[255]; uint8_t payloadLen;
+    if (readResponse(cmd, status, payload, payloadLen, 200)) {
+      if (cmd == CMD_INVENTORYISO_CONTINUE && status == 0x00) {
+        handleTagPayload(payload, payloadLen);
+      }
+      // status 0x12 (round complete) and 0x13 (no tag) are ignored to
+      // keep the CSV stream clean - no informational text mixed in.
+    }
+  }
+}
