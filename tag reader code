@@ -41,8 +41,8 @@
 // Pick the hardware serial port connected to the reader module.
 // Mega / Leonardo / ESP32 have a Serial1 you can use directly.
 #define READER_SERIAL Serial2   // ESP32: using Serial2 with explicit pins below
-#define READER_RX_PIN 26        // ESP32 GPIO26 <- module TX
-#define READER_TX_PIN 27        // ESP32 GPIO27 -> module RX
+#define READER_RX_PIN 27      // ESP32 GPIO26 <- module TX
+#define READER_TX_PIN 26        // ESP32 GPIO27 -> module RX
 
 // USB serial (to your PC / Serial Monitor) stays on Serial.
 // ---------------------------------------------------------------------
